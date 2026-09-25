@@ -1,0 +1,251 @@
+/*--------------------------------------------------------------------*
+ | Classe....: TMiniXPath                                             |
+ | Autor.....: Gerado para integração FiveWin + Harbour               |
+ | Objetivo..: Extrair disponibilidade NFC-e / EPEC via HTTP + regex |
+ *--------------------------------------------------------------------*/
+
+#include "FiveWin.ch"
+
+//--------------------------------------------------------------------//
+CLASS TMiniXPath
+
+   DATA cUrl           INIT "https://www.nfce.fazenda.sp.gov.br/NFCePortal/"
+   DATA cHtml          INIT ""
+   DATA lDisponibilidadeNFCe  INIT .F.
+   DATA lDisponibilidadeEPEC  INIT .F.
+   DATA cErro          INIT ""
+
+   METHOD New( cUrl )
+   METHOD GetHtml()
+   METHOD ExtrairPorId( cId )
+   METHOD Analisar()
+
+ENDCLASS
+
+//--------------------------------------------------------------------//
+METHOD New( cUrl ) CLASS TMiniXPath
+
+   if !Empty( cUrl )
+      ::cUrl := cUrl
+   endif
+
+return Self
+
+//--------------------------------------------------------------------//
+/* Baixa o HTML usando CreateObject("MSXML2.ServerXMLHTTP.6.0")       */
+/* com fallback para outras versoes do MSXML                           */
+//--------------------------------------------------------------------//
+METHOD GetHtml() CLASS TMiniXPath
+
+   local cRet     := ""
+   local oHttp
+   local aProgIDs := { "MSXML2.ServerXMLHTTP.6.0", ;
+                       "MSXML2.ServerXMLHTTP.3.0", ;
+                       "MSXML2.XMLHTTP.6.0",       ;
+                       "MSXML2.XMLHTTP",           ;
+                       "Microsoft.XMLHTTP" }
+   local i
+   local lOk      := .F.
+   local lSaiFora := .F.
+
+   for i := 1 to Len( aProgIDs )
+
+      TRY
+         if ! lOk // Faz loop enquanto nao acionar nenhum PROGID
+            oHttp := CreateObject( aProgIDs[ i ] )
+            if oHttp != NIL
+               // Timeouts (em milissegundos): resolve, connect, send, receive
+               TRY
+                  oHttp:setTimeouts( 5000, 5000, 10000, 15000 )
+               CATCH
+               END
+
+               oHttp:Open( "GET", ::cUrl, .F. )
+               // Cabecalhos: alguns portais .gov.br exigem User-Agent "real"
+               oHttp:SetRequestHeader( "User-Agent", ;
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + ;
+                  "AppleWebKit/537.36 (KHTML, like Gecko) " + ;
+                  "Chrome/122.0 Safari/537.36" )
+               oHttp:SetRequestHeader( "Accept", "text/html,application/xhtml+xml" )
+               oHttp:SetRequestHeader( "Accept-Language", "pt-BR,pt;q=0.9" )
+               oHttp:SetRequestHeader( "Cache-Control", "no-cache" )
+               oHttp:Send()
+
+               if oHttp:Status == 200
+                  cRet := oHttp:ResponseText
+                  lOk  := .T.
+               else
+                  ::cErro := "HTTP Status " + AllTrim( Str( oHttp:Status ) ) + ;
+                             " - " + oHttp:StatusText
+               endif
+
+               oHttp := NIL
+            endif
+         endif
+
+      CATCH oErr
+         ::cErro := "Excecao (" + aProgIDs[ i ] + "): " + oErr:Description
+         oHttp   := NIL
+         // continua tentando o proximo ProgID
+      END
+   next
+
+   ::cHtml := cRet
+
+return lOk
+
+//--------------------------------------------------------------------//
+/* Baixa o HTML usando MsgRun + API do Windows (WinHTTP via FW)      */
+//--------------------------------------------------------------------//
+METHOD GetHtmlTip() CLASS TMiniXPath
+
+   local cRet := ""
+   local oHttp
+
+   TRY
+      // FiveWin fornece TIPClientHttp (baseado em WinHTTP / WinINet)
+      oHttp := TIPClientHttp():New( ::cUrl, .F. )
+
+      if oHttp:Open()
+         oHttp:ReadAll( @cRet )
+         oHttp:Close()
+      else
+         ::cErro := "Falha ao abrir conexao HTTP."
+      endif
+   CATCH oErr
+      ::cErro := "Excecao HTTP: " + oErr:Description
+   END
+
+   ::cHtml := cRet
+
+return !Empty( ::cHtml )
+
+//--------------------------------------------------------------------//
+/* Extrai o conteudo interno de um elemento cujo atributo id bate     */
+/* Estrategia: localiza 'id="XXXX"', acha o '>' seguinte e captura    */
+/* ate o '</td>' (fechamento do td). Retorna o texto interno limpo.   */
+//--------------------------------------------------------------------//
+METHOD ExtrairPorId( cId ) CLASS TMiniXPath
+
+   local cMarca   := 'id="' + cId + '"'
+   local nPos     := At( cMarca, ::cHtml )
+   local nIni, nFim
+   local cTrecho  := ""
+   local cTexto   := ""
+
+   if nPos == 0
+      // Tenta variacao com aspas simples
+      cMarca := "id='" + cId + "'"
+      nPos   := At( cMarca, ::cHtml )
+   endif
+
+   if nPos == 0
+      return ""
+   endif
+
+   // Avanca ate o '>' que fecha a tag de abertura
+   nIni := At( ">", SubStr( ::cHtml, nPos ) )
+   if nIni == 0
+      return ""
+   endif
+   nIni := nPos + nIni   // posicao absoluta do '>' inicial
+
+   // Localiza o proximo '</td>'
+   nFim := At( "</td>", SubStr( ::cHtml, nIni ) )
+   if nFim == 0
+      nFim := At( "</TD>", SubStr( ::cHtml, nIni ) )
+   endif
+
+   if nFim == 0
+      return ""
+   endif
+   nFim := nIni + nFim - 1
+
+   cTrecho := SubStr( ::cHtml, nIni + 1, nFim - nIni - 1 )
+
+   // Limpa tags HTML internas, espacos, &nbsp;, quebras de linha
+   cTexto := LimparHtml( cTrecho )
+
+return cTexto
+
+//--------------------------------------------------------------------//
+/* Faz a analise final e popula as propriedades logicas               */
+//--------------------------------------------------------------------//
+METHOD Analisar() CLASS TMiniXPath
+
+   local cNFCe := ""
+   local cEPEC := ""
+
+   if Empty( ::cHtml )
+      if !::GetHtml()
+         return .F.
+      endif
+   endif
+
+   cNFCe := ::ExtrairPorId( "ctl00_ContentPlaceHolder1_tdDisponibilidadeNFCe" )
+   cEPEC := ::ExtrairPorId( "ctl00_ContentPlaceHolder1_tdDisponibilidadeEPEC" )
+
+   // --- NFC-e ---
+   // Cuidado: "Indisponível" contem "Disponível"
+   if "Indispon" $ cNFCe .or. "INDISPON" $ Upper( cNFCe )
+      ::lDisponibilidadeNFCe := .F.
+   elseif "Dispon" $ cNFCe .or. "DISPON" $ Upper( cNFCe )
+      ::lDisponibilidadeNFCe := .T.
+   else
+      ::lDisponibilidadeNFCe := .F.
+   endif
+
+   // --- EPEC ---
+   if "Indispon" $ cEPEC .or. "INDISPON" $ Upper( cEPEC )
+      ::lDisponibilidadeEPEC := .F.
+   elseif "Dispon" $ cEPEC .or. "DISPON" $ Upper( cEPEC )
+      ::lDisponibilidadeEPEC := .T.
+   else
+      ::lDisponibilidadeEPEC := .F.
+   endif
+
+return .T.
+
+//--------------------------------------------------------------------//
+/* Funcao auxiliar: remove tags HTML e normaliza texto                */
+//--------------------------------------------------------------------//
+STATIC FUNCTION LimparHtml( cTxt )
+
+   local cRet := cTxt
+   local nIni, nFim
+
+   // Remove <script>...</script> e <style>...</style> se houver
+   // (nao se aplica ao td, mas por seguranca)
+
+   // Remove todas as tags <...>
+   while ( nIni := At( "<", cRet ) ) > 0
+      nFim := At( ">", SubStr( cRet, nIni ) )
+      if nFim == 0
+         exit
+      endif
+      cRet := SubStr( cRet, 1, nIni - 1 ) + ;
+              SubStr( cRet, nIni + nFim )
+   enddo
+
+   // Entidades comuns
+   cRet := StrTran( cRet, "&nbsp;", " " )
+   cRet := StrTran( cRet, "&amp;",  "&" )
+   cRet := StrTran( cRet, "&lt;",   "<" )
+   cRet := StrTran( cRet, "&gt;",   ">" )
+   cRet := StrTran( cRet, "&aacute;","á" )
+   cRet := StrTran( cRet, "&iacute;","í" )
+   cRet := StrTran( cRet, "&ccedil;","ç" )
+
+   // Normaliza espacos
+   cRet := AllTrim( cRet )
+   do while "  " $ cRet
+      cRet := StrTran( cRet, "  ", " " )
+   enddo
+
+   // Remove CR/LF/TAB
+   cRet := StrTran( cRet, Chr(13), "" )
+   cRet := StrTran( cRet, Chr(10), "" )
+   cRet := StrTran( cRet, Chr(9),  "" )
+
+return cRet
+
